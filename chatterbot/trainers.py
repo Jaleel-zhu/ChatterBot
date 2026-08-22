@@ -611,6 +611,17 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
             print('Download location: %s' % file_path)
         return file_path
 
+    def _reject_symlinked_data_path(self):
+        # A trailing separator forces lstat to resolve the final component,
+        # so normpath first or islink silently returns False for a symlink.
+        if (
+            os.path.islink(os.path.normpath(self.data_directory))
+            or os.path.islink(os.path.normpath(self.data_path))
+        ):
+            raise self.TrainerInitializationException(
+                'Refusing to extract archive to a symbolic link: {}'.format(self.data_path)
+            )
+
     def extract(self, file_path: str):
         """
         Extract a tar file at the specified file path.
@@ -618,10 +629,7 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
         if not self.disable_progress:
             print('Extracting {}'.format(file_path))
 
-        if os.path.islink(self.data_path):
-            raise self.TrainerInitializationException(
-                'Refusing to extract archive to a symbolic link: {}'.format(self.data_path)
-            )
+        self._reject_symlinked_data_path()
 
         if not os.path.exists(self.data_path):
             os.makedirs(self.data_path)
@@ -631,9 +639,13 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
             abs_directory = os.path.realpath(directory)
             abs_target = os.path.realpath(target)
 
-            prefix = os.path.commonprefix([abs_directory, abs_target])
+            try:
+                common_path = os.path.commonpath([abs_directory, abs_target])
+            except ValueError:
+                # Raised when paths don't share a common root (e.g. different drives)
+                return False
 
-            return prefix == abs_directory
+            return common_path == abs_directory
 
         def safe_extract(tar, path='.', members=None, *, numeric_owner=False):
 
@@ -643,6 +655,9 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
                 member_path = os.path.join(path, member.name)
                 if not is_within_directory(path, member_path):
                     raise Exception('Attempted Path Traversal in Tar File')
+
+            # Narrow the TOCTOU window between directory setup and extraction
+            self._reject_symlinked_data_path()
 
             tar.extractall(path, members, numeric_owner=numeric_owner)
 

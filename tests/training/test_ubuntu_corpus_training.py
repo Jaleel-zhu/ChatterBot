@@ -287,3 +287,76 @@ class UbuntuCorpusTrainerTestCase(ChatBotTestCase):
             if os.path.exists(file_path):
                 os.remove(file_path)
             shutil.rmtree(attacker_target, ignore_errors=True)
+
+    def test_extract_raises_on_symlinked_data_directory(self):
+        """
+        Test that extract() raises when the parent data_directory (not just
+        data_path) is a symlink.
+
+        A local attacker can pre-create data_directory as a symlink before
+        data_path exists beneath it. data_path itself will be a real
+        directory once created, so checking only data_path is insufficient.
+        """
+        import tempfile
+        import shutil
+
+        attacker_target = tempfile.mkdtemp(prefix='cb_parent_symlink_attack_')
+        try:
+            file_object_path = self._create_test_corpus(self._get_data())
+
+            # Replace data_directory itself with a symlink before extraction
+            data_directory = os.path.normpath(self.trainer.data_directory)
+            shutil.rmtree(data_directory, ignore_errors=True)
+            os.symlink(attacker_target, data_directory)
+
+            with self.assertRaises(Exception):
+                self.trainer.extract(file_object_path)
+
+            self.assertEqual(
+                os.listdir(attacker_target), [],
+                'Files were written through the symlinked parent directory'
+            )
+        finally:
+            if os.path.islink(data_directory):
+                os.unlink(data_directory)
+            shutil.rmtree(attacker_target, ignore_errors=True)
+
+    def test_extract_rejects_sibling_path_with_shared_prefix(self):
+        """
+        Test that a tar member whose path resolves to a sibling directory
+        sharing a string prefix with data_path is rejected (e.g. data_path
+        is '.../ubuntu_dialogs' and the member escapes into
+        '.../ubuntu_dialogsEVIL').
+
+        os.path.commonprefix() performs a character-by-character string
+        comparison, not a path-component comparison, so '.../ubuntu_dialogs'
+        is treated as a prefix of '.../ubuntu_dialogsEVIL' and the escape is
+        incorrectly accepted. os.path.commonpath() must be used instead.
+        """
+        import shutil
+
+        os.makedirs(self.trainer.data_path, exist_ok=True)
+        sibling_dir = self.trainer.data_path.rstrip(os.sep) + 'EVIL'
+
+        try:
+            file_path = os.path.join(self.trainer.data_directory, 'sibling_escape.tgz')
+            with tarfile.TarFile(file_path, 'w') as tf:
+                payload = b'should not be written into the sibling directory\n'
+                # Escapes data_path into a sibling dir that shares a string
+                # prefix but is not actually contained within data_path.
+                member_name = os.path.join('..', os.path.basename(sibling_dir), 'pwned.txt')
+                member_info = tarfile.TarInfo(member_name)
+                member_info.size = len(payload)
+                tf.addfile(member_info, BytesIO(payload))
+
+            with self.assertRaises(Exception):
+                self.trainer.extract(file_path)
+
+            self.assertFalse(
+                os.path.exists(os.path.join(sibling_dir, 'pwned.txt')),
+                'File was written into a sibling directory sharing a string prefix with data_path'
+            )
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            shutil.rmtree(sibling_dir, ignore_errors=True)
