@@ -25,11 +25,6 @@ _DIR_FD_EXTRACTION_SUPPORTED = (
     and os.rename in os.supports_dir_fd
     and os.path.isdir('/proc/self/fd')
 )
-_DIR_FD_EXTRACTION_SUPPORTED = (
-    hasattr(os, 'O_NOFOLLOW')
-    and os.mkdir in os.supports_dir_fd
-    and os.rename in os.supports_dir_fd
-)
 
 
 class Trainer(object):
