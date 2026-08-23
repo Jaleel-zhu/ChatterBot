@@ -342,8 +342,8 @@ class UbuntuCorpusTrainerTestCase(ChatBotTestCase):
             file_path = os.path.join(self.trainer.data_directory, 'sibling_escape.tgz')
             with tarfile.TarFile(file_path, 'w') as tf:
                 payload = b'should not be written into the sibling directory\n'
-                # Escapes data_path into a sibling dir that shares a string
-                # prefix but is not actually contained within data_path.
+                # Escapes the extraction root into a sibling dir that shares
+                # a string prefix but is not actually contained within it.
                 member_name = os.path.join('..', os.path.basename(sibling_dir), 'pwned.txt')
                 member_info = tarfile.TarInfo(member_name)
                 member_info.size = len(payload)
@@ -360,3 +360,126 @@ class UbuntuCorpusTrainerTestCase(ChatBotTestCase):
             if os.path.exists(file_path):
                 os.remove(file_path)
             shutil.rmtree(sibling_dir, ignore_errors=True)
+
+    def test_extract_fails_closed_if_data_path_swapped_immediately_before_commit(self):
+        """
+        Test that extract() fails closed if data_path is replaced with a
+        symlink in the instant between the pre-commit check and the final
+        os.rename() call.
+
+        extractall() writes archive members one at a time, so a single
+        upfront symlink check on data_path leaves a window open for the
+        remainder of the extraction. This test simulates an attacker who
+        wins that race and plants the symlink immediately before the commit
+        step, confirming that os.rename() itself fails closed (a directory
+        cannot be renamed onto an existing symlink) instead of silently
+        extracting through it.
+        """
+        import tempfile
+        import shutil
+        from unittest.mock import patch
+
+        attacker_target = tempfile.mkdtemp(prefix='cb_toctou_rename_attack_')
+        real_rename = os.rename
+
+        def rename_after_attacker_swap(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            # dst may be a bare name resolved via dst_dir_fd (hardened path)
+            # or a full path (fallback path); resolve to an absolute target
+            # either way so the attacker's symlink lands in the right place.
+            target_path = os.path.join(self.trainer.data_directory, dst) if dst_dir_fd is not None else dst
+            # Simulate the attacker winning the race right before the commit.
+            if not os.path.exists(target_path):
+                os.symlink(attacker_target, target_path)
+            return real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        try:
+            file_object_path = self._create_test_corpus(self._get_data())
+
+            with patch('chatterbot.trainers.os.rename', side_effect=rename_after_attacker_swap):
+                with self.assertRaises(Exception):
+                    self.trainer.extract(file_object_path)
+
+            self.assertEqual(
+                os.listdir(attacker_target), [],
+                'Files were written through a symlink planted immediately before the atomic rename'
+            )
+        finally:
+            if os.path.islink(self.trainer.data_path):
+                os.unlink(self.trainer.data_path)
+            shutil.rmtree(attacker_target, ignore_errors=True)
+            self._destroy_test_corpus()
+
+    def test_extract_stays_within_original_directory_when_data_directory_relocated(self):
+        """
+        Test that extraction never leaks into an attacker's directory if
+        data_directory is renamed away and replaced with a symlink in the
+        window between opening the verified directory fd and creating the
+        staging directory.
+
+        Anchoring only the mkdir/rename calls to the fd (via dir_fd) is not
+        sufficient on its own: tarfile.extractall() writes through plain
+        path strings and will silently recreate a missing destination
+        through a freshly-planted symlink. The archive writes must also be
+        anchored, via the /proc/self/fd/N magic path, so the extraction
+        itself stays bound to the directory verified before the swap. The
+        pre-commit symlink re-check then detects the swapped data_directory
+        and aborts the commit, discarding the safely-extracted staging data
+        rather than landing it somewhere the trainer can no longer find.
+
+        Only meaningful on platforms with this hardening (Linux); skipped
+        elsewhere, where the narrower pre-existing protections still apply.
+        """
+        from chatterbot.trainers import _DIR_FD_EXTRACTION_SUPPORTED
+
+        if not _DIR_FD_EXTRACTION_SUPPORTED:
+            self.skipTest('dir_fd + /proc/self/fd extraction hardening is not supported on this platform')
+
+        import tempfile
+        import shutil
+        from unittest.mock import patch
+
+        # Build the input archive in an independent location so that
+        # relocating data_directory mid-extraction doesn't also hide the
+        # archive being read.
+        independent_dir = tempfile.mkdtemp(prefix='cb_relocate_input_')
+        data = self._get_data()
+        file_object_path = os.path.join(independent_dir, 'corpus.tgz')
+        with tarfile.TarFile(file_object_path, 'w') as tf:
+            payload = data[0]
+            info = tarfile.TarInfo('dialogs/3/1.tsv')
+            info.size = len(payload)
+            tf.addfile(info, BytesIO(payload))
+
+        attacker_target = tempfile.mkdtemp(prefix='cb_relocate_attack_')
+        data_directory = os.path.normpath(self.trainer.data_directory)
+        relocated_original = data_directory + '.orig'
+        real_mkdir = os.mkdir
+        swapped = []
+
+        def mkdir_after_relocation(*args, **kwargs):
+            if not swapped:
+                swapped.append(True)
+                os.rename(data_directory, relocated_original)
+                os.symlink(attacker_target, data_directory)
+            return real_mkdir(*args, **kwargs)
+
+        os.makedirs(data_directory, exist_ok=True)
+
+        try:
+            with patch('chatterbot.trainers.os.mkdir', side_effect=mkdir_after_relocation):
+                # The pre-commit re-check detects the swapped data_directory
+                # and aborts; the key property under test is that nothing
+                # leaks to the attacker, not that this specific call succeeds.
+                with self.assertRaises(Exception):
+                    self.trainer.extract(file_object_path)
+
+            self.assertEqual(
+                os.listdir(attacker_target), [],
+                'Files were written into the attacker directory after data_directory was relocated'
+            )
+        finally:
+            if os.path.islink(data_directory):
+                os.unlink(data_directory)
+            shutil.rmtree(relocated_original, ignore_errors=True)
+            shutil.rmtree(attacker_target, ignore_errors=True)
+            shutil.rmtree(independent_dir, ignore_errors=True)
