@@ -483,3 +483,18 @@ class UbuntuCorpusTrainerTestCase(ChatBotTestCase):
             shutil.rmtree(relocated_original, ignore_errors=True)
             shutil.rmtree(attacker_target, ignore_errors=True)
             shutil.rmtree(independent_dir, ignore_errors=True)
+
+    def test_dir_fd_extraction_support_implies_procfs(self):
+        """
+        The dir_fd extraction path anchors tarfile's writes through
+        /proc/self/fd/N, so it must stay disabled anywhere procfs is absent.
+        Enabling it without procfs makes extract() fail on the first write.
+        """
+        from chatterbot import trainers
+
+        if trainers._DIR_FD_EXTRACTION_SUPPORTED:
+            self.assertTrue(
+                os.path.isdir('/proc/self/fd'),
+                'dir_fd extraction is enabled but /proc/self/fd is unavailable, '
+                'so the extraction root resolves to a nonexistent path'
+            )
