@@ -3,12 +3,28 @@ import csv
 import time
 import glob
 import json
+import shutil
+import secrets
 import tarfile
 from typing import List, Union
 from tqdm import tqdm
 from dateutil import parser as date_parser
 from chatterbot.chatterbot import ChatBot
 from chatterbot.conversation import Statement
+
+# True where a directory fd opened with O_NOFOLLOW can fully anchor both
+# directory-metadata operations (mkdir/rename via dir_fd) and the archive
+# writes tarfile itself performs (via the /proc/self/fd/N magic path). Both
+# are required together: anchoring mkdir/rename alone is not enough, since
+# tarfile.extractall() writes through plain path strings and will silently
+# recreate a missing destination through a symlink planted over data_directory.
+# Currently Linux-only, since it depends on procfs.
+_DIR_FD_EXTRACTION_SUPPORTED = (
+    hasattr(os, 'O_NOFOLLOW')
+    and os.mkdir in os.supports_dir_fd
+    and os.rename in os.supports_dir_fd
+    and os.path.isdir('/proc/self/fd')
+)
 
 
 class Trainer(object):
@@ -579,9 +595,16 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
         """
         import requests
 
+        self._reject_symlinked_path(self.data_directory)
+
         # Create the data directory if it does not already exist
         if not os.path.exists(self.data_directory):
-            os.makedirs(self.data_directory)
+            try:
+                os.makedirs(self.data_directory)
+            except FileExistsError as e:
+                raise self.TrainerInitializationException(
+                    'Unable to create data directory {}: {}'.format(self.data_directory, e)
+                ) from e
 
         file_name = url.split('/')[-1]
         file_path = os.path.join(self.data_directory, file_name)
@@ -597,8 +620,10 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
             total_length = response.headers.get('content-length')
 
             if total_length is None:
-                # No content length header
-                open_file.write(response.content)
+                # No content length header. Stream regardless of whether
+                # progress is shown, to avoid buffering the whole body in memory.
+                for data in response.iter_content(chunk_size=4096):
+                    open_file.write(data)
             else:
                 for data in tqdm(
                     response.iter_content(chunk_size=4096),
@@ -611,6 +636,29 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
             print('Download location: %s' % file_path)
         return file_path
 
+    def _reject_symlinked_path(self, path):
+        # A trailing separator forces lstat to resolve the final component,
+        # so normpath first or islink silently returns False for a symlink.
+        if os.path.islink(os.path.normpath(path)):
+            raise self.TrainerInitializationException(
+                'Refusing to use a symbolic link as a data path: {}'.format(path)
+            )
+
+    def _reject_symlinked_data_path(self):
+        self._reject_symlinked_path(self.data_directory)
+        self._reject_symlinked_path(self.data_path)
+
+    def _open_verified_directory_fd(self, path):
+        # O_NOFOLLOW makes this fail instead of dereferencing a symlink. The
+        # returned fd stays bound to this exact directory inode even if the
+        # path is later replaced, so dir_fd-relative ops can't be redirected.
+        try:
+            return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as e:
+            raise self.TrainerInitializationException(
+                'Refusing to extract archive: unable to safely open {}: {}'.format(path, e)
+            ) from e
+
     def extract(self, file_path: str):
         """
         Extract a tar file at the specified file path.
@@ -618,22 +666,28 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
         if not self.disable_progress:
             print('Extracting {}'.format(file_path))
 
-        if os.path.islink(self.data_path):
-            raise self.TrainerInitializationException(
-                'Refusing to extract archive to a symbolic link: {}'.format(self.data_path)
-            )
+        self._reject_symlinked_data_path()
 
-        if not os.path.exists(self.data_path):
-            os.makedirs(self.data_path)
+        if not os.path.exists(self.data_directory):
+            try:
+                os.makedirs(self.data_directory)
+            except FileExistsError as e:
+                raise self.TrainerInitializationException(
+                    'Unable to create data directory {}: {}'.format(self.data_directory, e)
+                ) from e
 
         def is_within_directory(directory, target):
 
             abs_directory = os.path.realpath(directory)
             abs_target = os.path.realpath(target)
 
-            prefix = os.path.commonprefix([abs_directory, abs_target])
+            try:
+                common_path = os.path.commonpath([abs_directory, abs_target])
+            except ValueError:
+                # Raised when paths don't share a common root (e.g. different drives)
+                return False
 
-            return prefix == abs_directory
+            return common_path == abs_directory
 
         def safe_extract(tar, path='.', members=None, *, numeric_owner=False):
 
@@ -644,15 +698,78 @@ class UbuntuCorpusTrainer(CsvFileTrainer):
                 if not is_within_directory(path, member_path):
                     raise Exception('Attempted Path Traversal in Tar File')
 
-            tar.extractall(path, members, numeric_owner=numeric_owner)
+            extract_kwargs = {}
+            if hasattr(tarfile, 'data_filter'):
+                # Belt-and-suspenders: also apply the standard library's own
+                # vetted extraction filter (PEP 706) alongside the checks above.
+                extract_kwargs['filter'] = 'data'
+
+            tar.extractall(path, members, numeric_owner=numeric_owner, **extract_kwargs)
+
+        # Extract into an unpredictably-named staging directory rather than
+        # data_path directly, then commit it into place with a single atomic
+        # rename. extractall() writes members one at a time, so checking
+        # data_path once up front leaves a window for an attacker to swap it
+        # for a symlink mid-extraction. Renaming a directory onto an existing
+        # symlink fails closed with ENOTDIR instead of writing through it, so
+        # no window remains at the point the data actually lands at data_path.
+        #
+        # Where supported, the mkdir, the extraction writes, and the final
+        # rename are all additionally anchored to a directory fd opened with
+        # O_NOFOLLOW, via dir_fd for mkdir/rename and via the /proc/self/fd/N
+        # magic path for the archive writes themselves (tarfile has no dir_fd
+        # support of its own, and will happily recreate a missing destination
+        # through a symlink planted over data_directory if given a plain
+        # path). Anchoring only the mkdir/rename and not the archive writes
+        # would be worse than not anchoring at all: it would silently leave
+        # the real destination empty while extracting through the symlink.
+        base_fd = None
+        extraction_root = self.data_directory
+        if _DIR_FD_EXTRACTION_SUPPORTED:
+            base_fd = self._open_verified_directory_fd(self.data_directory)
+            extraction_root = '/proc/self/fd/{}'.format(base_fd)
+
+        staging_name = 'tmp_' + secrets.token_hex(8)
+        staging_dir = os.path.join(extraction_root, staging_name)
 
         try:
-            with tarfile.open(file_path, 'r') as tar:
-                safe_extract(tar, path=self.data_path, members=tqdm(tar, disable=self.disable_progress))
-        except tarfile.ReadError as e:
-            raise self.TrainerInitializationException(
-                f'The provided data file is not a valid tar file: {file_path}'
-            ) from e
+            try:
+                if base_fd is not None:
+                    os.mkdir(staging_name, dir_fd=base_fd)
+                else:
+                    os.mkdir(staging_dir)
+            except OSError as e:
+                raise self.TrainerInitializationException(
+                    'Unable to create a staging directory for extraction: {}'.format(e)
+                ) from e
+
+            try:
+                with tarfile.open(file_path, 'r') as tar:
+                    safe_extract(tar, path=staging_dir, members=tqdm(tar, disable=self.disable_progress))
+            except tarfile.ReadError as e:
+                raise self.TrainerInitializationException(
+                    f'The provided data file is not a valid tar file: {file_path}'
+                ) from e
+
+            # Re-check immediately before the commit to narrow the race window further
+            self._reject_symlinked_data_path()
+
+            final_name = os.path.basename(self.data_path)
+            try:
+                if base_fd is not None:
+                    os.rename(staging_name, final_name, src_dir_fd=base_fd, dst_dir_fd=base_fd)
+                else:
+                    os.rename(staging_dir, self.data_path)
+            except OSError as e:
+                raise self.TrainerInitializationException(
+                    'Refusing to commit extracted archive to {}: {}'.format(self.data_path, e)
+                ) from e
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        finally:
+            if base_fd is not None:
+                os.close(base_fd)
 
         self.chatbot.logger.info('File extracted to {}'.format(self.data_path))
 
